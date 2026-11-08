@@ -48,6 +48,7 @@ st.write(
     "the same underlying question."
 )
 
+
 @st.cache_resource(show_spinner="Loading the trained model and supporting files...")
 def get_artifacts():
     return load_artifacts("artifacts")
@@ -60,7 +61,8 @@ except Exception as exc:
     st.exception(exc)
     st.info(
         "Check that all five exported files are inside the project's "
-        "`artifacts` folder, then restart Streamlit."
+        "artifacts folder and that requirements.txt installs the dependencies. "
+        "Then reboot the app."
     )
     st.stop()
 
@@ -100,9 +102,13 @@ if submitted:
                 st.subheader("Prediction")
 
                 if result["prediction"] == 1:
-                    st.success("The model predicts that these questions are duplicates.")
+                    st.success(
+                        "The model predicts that these questions are duplicates."
+                    )
                 else:
-                    st.info("The model predicts that these questions are not duplicates.")
+                    st.info(
+                        "The model predicts that these questions are not duplicates."
+                    )
 
                 st.metric("Duplicate probability", f"{percentage:.2f}%")
                 st.progress(float(max(0.0, min(1.0, probability))))

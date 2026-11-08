@@ -277,36 +277,77 @@ def fuzzy_features(q1, q2):
     ]
 
 
-def build_engineered_features(question1, question2, question_frequency, stemmed_stop_words):
-    """Return one row in the exact 24-feature order used by the DL scaler."""
+# These names describe the values generated below. The saved artifact may
+# store them in a different order; we always reorder by the saved column list.
+CANONICAL_FEATURE_COLUMNS = [
+    "q1_len", "q2_len", "q1_num_words", "q2_num_words",
+    "word_common", "word_total", "word_share", "q1_freq", "q2_freq",
+    "cwc_min", "cwc_max", "csc_min", "csc_max", "ctc_min", "ctc_max",
+    "last_word_eq", "first_word_eq", "abs_len_diff", "mean_len",
+    "longest_substr_ratio", "fuzz_ratio", "fuzz_partial_ratio",
+    "token_sort_ratio", "token_set_ratio",
+]
+
+
+def build_engineered_features(
+    question1,
+    question2,
+    question_frequency,
+    stemmed_stop_words,
+    feature_columns,
+):
+    """Build the 24 engineered features in the exact saved scaler order."""
     q1 = preprocess_question(question1)
     q2 = preprocess_question(question2)
 
     common = common_words(q1, q2)
     total = total_words(q1, q2)
 
-    values = [
-        len(q1),                         # q1_len
-        len(q2),                         # q2_len
-        len(q1.split(" ")),              # q1_num_words
-        len(q2.split(" ")),              # q2_num_words
-        common,                          # word_common
-        total,                           # word_total
-        round(common / total, 2),          # word_share
-        question_frequency.get(q1, 0),   # q1_freq
-        question_frequency.get(q2, 0),   # q2_freq
-    ]
+    token_values = token_features(q1, q2, stemmed_stop_words)
+    length_values = length_features(q1, q2)
+    fuzzy_values = fuzzy_features(q1, q2)
 
-    values.extend(token_features(q1, q2, stemmed_stop_words))
-    values.extend(length_features(q1, q2))
-    values.extend(fuzzy_features(q1, q2))
+    # Use named values rather than relying on positional assumptions.
+    feature_values = {
+        "q1_len": len(q1),
+        "q2_len": len(q2),
+        "q1_num_words": len(q1.split(" ")),
+        "q2_num_words": len(q2.split(" ")),
+        "word_common": common,
+        "word_total": total,
+        "word_share": round(common / (total + 0.0001), 2),
+        "q1_freq": question_frequency.get(q1, 0),
+        "q2_freq": question_frequency.get(q2, 0),
+        "cwc_min": token_values[0],
+        "cwc_max": token_values[1],
+        "csc_min": token_values[2],
+        "csc_max": token_values[3],
+        "ctc_min": token_values[4],
+        "ctc_max": token_values[5],
+        "last_word_eq": token_values[6],
+        "first_word_eq": token_values[7],
+        "abs_len_diff": length_values[0],
+        "mean_len": length_values[1],
+        "longest_substr_ratio": length_values[2],
+        "fuzz_ratio": fuzzy_values[0],
+        "fuzz_partial_ratio": fuzzy_values[1],
+        "token_sort_ratio": fuzzy_values[2],
+        "token_set_ratio": fuzzy_values[3],
+    }
 
-    return np.asarray(values, dtype=np.float32).reshape(1, -1), q1, q2
+    # This is the critical fix: scaler.transform receives columns in the
+    # precise order recorded when the scaler was fitted in the notebook.
+    ordered_values = [feature_values[column] for column in feature_columns]
+    numeric_row = np.asarray(ordered_values, dtype=np.float32).reshape(1, -1)
+    return numeric_row, q1, q2
 
 
 def load_artifacts(artifacts_dir="artifacts"):
-    """Load the five files exported from Colab."""
+    """Load the five files exported from the training notebook."""
     folder = Path(artifacts_dir)
+    if not folder.is_absolute():
+        folder = Path(__file__).resolve().parent / folder
+
     required = {
         "model": folder / "quora_siamese_bilstm.keras",
         "tokenizer": folder / "quora_tokenizer.pkl",
@@ -315,30 +356,62 @@ def load_artifacts(artifacts_dir="artifacts"):
         "frequency": folder / "question_frequency.pkl",
     }
 
-    missing = [str(path) for path in required.values() if not path.exists()]
+    missing = [str(path) for path in required.values() if not path.is_file()]
     if missing:
         raise FileNotFoundError(
-            "Missing model artifact(s):\n- " + "\n- ".join(missing)
-            + "\n\nPlace all five exported files inside the 'artifacts' folder."
+            "Missing model artifact(s):\\n- " + "\\n- ".join(missing)
+            + "\\n\\nPlace all five exported files inside the 'artifacts' folder."
         )
 
-    with open(required["tokenizer"], "rb") as f:
+    with required["tokenizer"].open("rb") as f:
         tokenizer = pickle.load(f)
-    with open(required["scaler"], "rb") as f:
+    with required["scaler"].open("rb") as f:
         scaler = pickle.load(f)
-    with open(required["feature_columns"], "rb") as f:
+    with required["feature_columns"].open("rb") as f:
         feature_columns = pickle.load(f)
-    with open(required["frequency"], "rb") as f:
+    with required["frequency"].open("rb") as f:
         question_frequency = pickle.load(f)
 
-    # The notebook's stopword list was Porter-stemmed, even though its
-    # actual preprocess() function does not stem question text.
+    if not isinstance(feature_columns, (list, tuple)):
+        raise TypeError("The feature-column artifact must contain a list or tuple.")
+
+    feature_columns = list(feature_columns)
+
+    # Validate names and count, but do NOT require a particular order.
+    # The saved order is authoritative because it matches the fitted scaler.
+    if len(feature_columns) != len(set(feature_columns)):
+        raise ValueError("The saved feature-column list contains duplicate names.")
+
+    missing_columns = [c for c in CANONICAL_FEATURE_COLUMNS if c not in feature_columns]
+    extra_columns = [c for c in feature_columns if c not in CANONICAL_FEATURE_COLUMNS]
+    if missing_columns or extra_columns or len(feature_columns) != len(CANONICAL_FEATURE_COLUMNS):
+        raise ValueError(
+            "The saved feature names do not match the 24 features generated by the app.\\n"
+            f"Missing: {missing_columns}\\nExtra: {extra_columns}\\n"
+            f"Saved: {feature_columns}"
+        )
+
+    scaler_feature_count = getattr(scaler, "n_features_in_", len(feature_columns))
+    if scaler_feature_count != len(feature_columns):
+        raise ValueError(
+            "The scaler's feature count does not match the saved feature list: "
+            f"scaler={scaler_feature_count}, columns={len(feature_columns)}."
+        )
+
+    # The notebook creates STEMMED_STOP_WORDS for token features, although
+    # preprocess() itself does not stem the questions.
     from nltk.corpus import stopwords
     import nltk
+
     try:
         raw_stopwords = stopwords.words("english")
     except LookupError:
-        nltk.download("stopwords", quiet=True)
+        downloaded = nltk.download("stopwords", quiet=True)
+        if not downloaded:
+            raise RuntimeError(
+                "NLTK English stopwords are unavailable. Check the app's internet access "
+                "or install the stopwords corpus before deployment."
+            )
         raw_stopwords = stopwords.words("english")
 
     stemmer = PorterStemmer()
@@ -349,24 +422,6 @@ def load_artifacts(artifacts_dir="artifacts"):
         custom_objects={"AbsoluteDifference": AbsoluteDifference},
         compile=False,
     )
-
-    expected_columns = [
-        "q1_len", "q2_len", "q1_num_words", "q2_num_words",
-        "word_common", "word_total", "word_share", "q1_freq", "q2_freq",
-        "cwc_min", "cwc_max", "csc_min", "csc_max", "ctc_min", "ctc_max",
-        "last_word_eq", "first_word_eq", "abs_len_diff", "mean_len",
-        "longest_substr_ratio", "fuzz_ratio", "fuzz_partial_ratio",
-        "token_sort_ratio", "token_set_ratio",
-    ]
-
-    if list(feature_columns) != expected_columns:
-        raise ValueError(
-            "Feature-column order does not match the app's inference pipeline.\n"
-            f"Loaded: {list(feature_columns)}\nExpected: {expected_columns}"
-        )
-
-    if getattr(scaler, "n_features_in_", len(feature_columns)) != len(feature_columns):
-        raise ValueError("The scaler's feature count does not match the feature list.")
 
     return {
         "model": model,
@@ -380,7 +435,9 @@ def load_artifacts(artifacts_dir="artifacts"):
 
 def predict_pair(question1, question2, artifacts):
     """Return duplicate probability and class using the notebook's 0.5 threshold."""
-    if not question1 or not question2 or not question1.strip() or not question2.strip():
+    if not isinstance(question1, str) or not isinstance(question2, str):
+        raise TypeError("Both questions must be text strings.")
+    if not question1.strip() or not question2.strip():
         raise ValueError("Please enter both questions.")
 
     q1_clean = preprocess_question(question1)
@@ -390,12 +447,18 @@ def predict_pair(question1, question2, artifacts):
     q2_seq = artifacts["tokenizer"].texts_to_sequences([q2_clean])
 
     q1_pad = pad_sequences(
-        q1_seq, maxlen=MAX_SEQUENCE_LENGTH,
-        padding="post", truncating="post", dtype="int32"
+        q1_seq,
+        maxlen=MAX_SEQUENCE_LENGTH,
+        padding="post",
+        truncating="post",
+        dtype="int32",
     )
     q2_pad = pad_sequences(
-        q2_seq, maxlen=MAX_SEQUENCE_LENGTH,
-        padding="post", truncating="post", dtype="int32"
+        q2_seq,
+        maxlen=MAX_SEQUENCE_LENGTH,
+        padding="post",
+        truncating="post",
+        dtype="int32",
     )
 
     numeric_row, _, _ = build_engineered_features(
@@ -403,26 +466,27 @@ def predict_pair(question1, question2, artifacts):
         question2,
         artifacts["question_frequency"],
         artifacts["stemmed_stop_words"],
+        artifacts["feature_columns"],
     )
 
-    if numeric_row.shape[1] != len(artifacts["feature_columns"]):
+    expected_count = len(artifacts["feature_columns"])
+    if numeric_row.shape[1] != expected_count:
         raise ValueError(
             f"Generated {numeric_row.shape[1]} features, but the scaler expects "
-            f"{len(artifacts['feature_columns'])}."
+            f"{expected_count}."
         )
 
     scaled_row = artifacts["scaler"].transform(numeric_row).astype(np.float32)
 
-    probability = float(
-        artifacts["model"].predict(
-            {
-                "q1_input": q1_pad,
-                "q2_input": q2_pad,
-                "engineered_input": scaled_row,
-            },
-            verbose=0,
-        )[0][0]
+    prediction_output = artifacts["model"].predict(
+        {
+            "q1_input": q1_pad,
+            "q2_input": q2_pad,
+            "engineered_input": scaled_row,
+        },
+        verbose=0,
     )
+    probability = float(np.asarray(prediction_output).reshape(-1)[0])
 
     return {
         "probability": probability,
